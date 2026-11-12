@@ -52,6 +52,7 @@ import { resolveCopilotMcpServerInfo, type ICopilotPluginInfo } from '../../node
 import { CopilotGitHubCredentials, CopilotGitHubSessionCredentials } from '../../node/copilot/copilotGitHubCredentials.js';
 import { CopilotExtensionsReloadToolName } from '../../node/copilot/copilotExtensionTools.js';
 import { CopilotManagedSettingsResolver } from '../../node/copilot/copilotManagedSettings.js';
+import type { ICopilotAccountService } from '../../node/copilot/copilotAccountService.js';
 import { buildCopilotBuiltinAgents } from '../../node/copilot/copilotBuiltinAgents.js';
 import type { ShellManager } from '../../node/copilot/copilotShellTools.js';
 import type { CopilotSessionWrapper } from '../../node/copilot/copilotSessionWrapper.js';
@@ -418,6 +419,33 @@ suite('CopilotSessionLauncher agent catalog readiness', () => {
 				}
 			});
 		}
+	}
+});
+
+suite('CopilotSessionLauncher discovery-only boundary', () => {
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	for (const kind of ['create', 'resume'] as const) {
+		test(`${kind} does not treat account discovery as conversation authentication`, async () => {
+			const accountService = upcastPartial<ICopilotAccountService>({
+				state: upcastPartial<ICopilotAccountService['state']>({ get: () => ({ kind: 'error', entraAccountId: 'selected', stage: 'discovery' }) }),
+				requireReady: () => upcastPartial<ReturnType<ICopilotAccountService['requireReady']>>({ kind: 'ready' }),
+			});
+			const launcher = createTestLauncher(undefined, undefined, undefined, undefined,
+				upcastPartial<IAgentConfigurationService>({ copilotM365EnabledAtStartup: true }),
+				undefined, undefined, accountService);
+			const base = {
+				client: new class extends mock<CopilotClient>() { }(), sessionId: 'discovery-only',
+				workingDirectory: testWorkingDirectory, resolvedAgentName: undefined,
+				snapshot: { discoveredAgents: [], additionalRootInstructions: [], tools: [], plugins: [], mcpServers: {} },
+				activeClientToolSet: new ActiveClientToolSet(), shellManager: undefined,
+				githubCredentials: CopilotGitHubSessionCredentials.fromClientAuthentication(undefined),
+			};
+			const plan: CopilotSessionLaunchPlan = kind === 'create'
+				? { ...base, kind, model: undefined }
+				: { ...base, kind, fallback: { model: undefined } };
+			await assert.rejects(launcher.launch(plan, testRuntime), /conversation authentication is not yet available/);
+		});
 	}
 });
 
@@ -899,6 +927,20 @@ suite('CopilotSessionLauncher sandbox policy', () => {
 				userPolicy: { filesystem: { readonlyPaths: [URI.file('/session-data/sess-1/attachments').fsPath] } },
 			};
 			assert.deepStrictEqual(fixture.updates.filter(update => update.sandboxConfig).map(update => update.sandboxConfig), [expected]);
+		});
+
+		test(`${kind} opens the SDK session in the permission mode resolved after the approval policy is known`, async () => {
+			const fixture = setup(kind);
+			const calls: string[] = [];
+			store.add(await fixture.launcher.launch(fixture.plan, {
+				...fixture.runtime,
+				setApprovalPolicy: () => calls.push('policy'),
+				resolveInitialPermissionMode: () => { calls.push('mode'); return 'assisted'; },
+			}));
+			const requested = fixture.captured?.permissionMode;
+			store.add(await fixture.launcher.launch(fixture.plan, { ...fixture.runtime, resolveInitialPermissionMode: () => undefined }));
+
+			assert.deepStrictEqual({ calls, requested, unresolved: Object.hasOwn(fixture.captured ?? {}, 'permissionMode') }, { calls: ['policy', 'mode'], requested: 'assisted', unresolved: false });
 		});
 
 		test(`${kind} waits for slow managed settings before applying policy and starting the SDK session`, async () => {
@@ -3048,6 +3090,24 @@ suite('CopilotSessionLauncher resume fallback', () => {
 		try {
 			sessions.add(await launcher.launch(plan, testRuntime));
 			assert.strictEqual(getCreateSessionCalls(), 1);
+		} finally {
+			sessions.dispose();
+			await launcher.disposeByokProxyHandle();
+		}
+	});
+
+	test('opens the session created after a failed resume in the same permission mode', async () => {
+		const { launcher, plan } = createResumeFailingLaunch('Request session.resume failed with message: Session not found: session-1');
+		const modes: unknown[] = [];
+		const client = plan.client;
+		const { createSession, resumeSession } = client;
+		client.createSession = config => { modes.push(['create', config.permissionMode]); return createSession.call(client, config); };
+		client.resumeSession = (id, config) => { modes.push(['resume', config.permissionMode]); return resumeSession.call(client, id, config); };
+
+		const sessions = new DisposableStore();
+		try {
+			sessions.add(await launcher.launch(plan, { ...testRuntime, resolveInitialPermissionMode: () => 'allow-all' }));
+			assert.deepStrictEqual(modes, [['resume', 'allow-all'], ['create', 'allow-all']]);
 		} finally {
 			sessions.dispose();
 			await launcher.disposeByokProxyHandle();
